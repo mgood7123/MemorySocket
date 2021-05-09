@@ -1,0 +1,18 @@
+#include <chrono>
+using namespace std::chrono_literals;
+
+namespace std {
+    template< class Rep, class Period, class Predicate >
+    bool timeout(const std::chrono::duration<Rep, Period>& rel_time, Predicate pred) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto end = start + rel_time;
+        bool status = true;
+        do {
+            status = !pred();
+            if (status == false) break;
+        } while(std::chrono::high_resolution_clock::now() < end);
+        return status;
+    }
+    
+    static constexpr bool timed_out = true;
+}

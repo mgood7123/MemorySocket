@@ -1,0 +1,168 @@
+//
+//  MemorySocket.hpp
+//  RealTimeThreadCommunicator
+//
+//  Created by Matthew Good on 23/3/21.
+//
+
+#ifndef MemorySocket_hpp
+#define MemorySocket_hpp
+
+#include <atomic> // atomic
+#include <memory.h> // mem*
+#include <inttypes.h> // fixes size types
+#include "Log.hpp"
+#include <yamc/yamc_semaphore.hpp>
+#include "Ordered_Access.h"
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <yamc/posix_native_mutex.hpp>
+typedef yamc::posix::mutex YAMC_MUTEX;
+#endif
+#if defined(_WIN32)
+#include <yamc/win_native_mutex.hpp>
+typedef yamc::win::mutex YAMC_MUTEX;
+#endif
+
+#define MS_MSG_OOB                  0x1             /* process out-of-band data */
+#define MS_MSG_PEEK                 0x2             /* peek at incoming message */
+#define MS_MSG_DONTROUTE            0x4             /* send without using routing tables */
+#define MS_MSG_EOR                  0x8             /* data completes record */
+#define MS_MSG_TRUNC                0x10            /* data discarded before delivery */
+#define MS_MSG_CTRUNC               0x20            /* control data lost before delivery */
+#define MS_MSG_WAITALL              0x40            /* wait for full request or error */
+#define MS_MSG_DONTWAIT             0x80            /* this message should be nonblocking */
+#define MS_MSG_EOF                  0x100           /* data completes connection */
+#define MS_MSG_WAITSTREAM           0x200           /* wait up to full request.. may return partial */
+#define MS_MSG_FLUSH                0x400           /* Start of 'hold' seq; dump so_temp, deprecated */
+#define MS_MSG_HOLD                 0x800           /* Hold frag in so_temp, deprecated */
+#define MS_MSG_SEND                 0x1000          /* Send the packet in so_temp, deprecated */
+#define MS_MSG_HAVEMORE             0x2000          /* Data ready to be read */
+#define MS_MSG_RCVMORE              0x4000          /* Data remains in current pkt */
+#define MS_MSG_BLOCK                0x8000          /* Block when data is unavailable */
+#define MS_MSG_NEEDSA               0x10000         /* Fail receive if socket address cannot be allocated */
+#define MS_MSG_DEBUG                0x40000         /* Output debug info */
+#define MS_MSG_NOSIGNAL             0x80000         /* do not generate SIGPIPE on EOF */
+#define MS_MSG_FORCE_BLOCK          0x100000        /* Force blocking mode transfer */
+#define MS_MSG_FORCE_NON_BLOCKING   0x200000        /* Force non-blocking mode transfer */
+
+class MemorySocket {
+
+    int global_flags;
+public:
+    static const int8_t RESERVED_CAPACITY;
+    // 1. we need to be able to send an arbitrary amount of data
+    // 2. we need to be able to retrieve an arbitary amount of data
+
+    std::atomic<int8_t> * memory = nullptr;
+    size_t capacityInBytes;
+
+    MemorySocket(size_t capacityInBytes) {
+        this->capacityInBytes = capacityInBytes;
+        memory = new std::atomic<int8_t>[RESERVED_CAPACITY+capacityInBytes];
+    }
+
+    MemorySocket(size_t capacityInBytes, int global_flags): MemorySocket(capacityInBytes) {
+        setGlobalFlags(global_flags);
+    }
+
+    ~MemorySocket() {
+        delete[] memory;
+    }
+    
+    void setGlobalFlags(int flags) {
+        if (flags & MS_MSG_FORCE_BLOCK) {
+            LOG_ALWAYS_FATAL("global flags cannot force blocking");
+        }
+        if (flags & MS_MSG_FORCE_NON_BLOCKING) {
+            LOG_ALWAYS_FATAL("global flags cannot force non-blocking");
+        }
+        this->global_flags = flags;
+    }
+
+    constexpr static int nop = 0;
+    // initialized to -1 (reset)
+    Ordered_Access_Named(int, READWRITE);
+
+    int send(const void * buffer, size_t length, int flags) {
+        return send(nullptr, buffer, length, flags);
+    }
+
+    int send(const char * TAG, const void * buffer, size_t length, int flags) {
+        int combined_flags = flags | global_flags;
+        bool debug = false;
+        bool blocking = false;
+
+        // handle flags
+        if (combined_flags & MS_MSG_DEBUG) debug = true;
+        if (flags & MS_MSG_FORCE_BLOCK && flags & MS_MSG_FORCE_NON_BLOCKING) {
+            LOG_ALWAYS_FATAL("error: flags cannot force both blocking and non-blocking");
+        }
+        if (combined_flags & MS_MSG_BLOCK) {
+            if (!(flags & MS_MSG_FORCE_NON_BLOCKING) || flags & MS_MSG_FORCE_BLOCK) {
+                blocking = true;
+            }
+        }
+
+        const int8_t * memory_ = reinterpret_cast<const int8_t *>(buffer);
+
+        if (length <= capacityInBytes) {
+            if (debug) LOG_INFO_TAG(TAG, "buffer can fit inside memory");
+            if (blocking) {
+                for (int i = 0; i < length; i++) {
+                    memory[RESERVED_CAPACITY + i].store(memory_[i]);
+                }
+                // signal that we have data
+                READWRITE.store(nop, 0, "send");
+                // wait until our data has been read before we overwrite it again
+                READWRITE.load_and_reset_order(3, "send");
+            }
+        } else {
+            if (debug) LOG_INFO_TAG(TAG, "buffer cannot fit inside memory");
+        }
+        return 0;
+    };
+
+    int recv(void * buffer, size_t length, int flags) {
+        return recv(nullptr, buffer, length, flags);
+    }
+
+    int recv(const char * TAG, void * buffer, size_t length, int flags) {
+        int combined_flags = flags | global_flags;
+        bool debug = false;
+        bool blocking = false;
+
+        // handle flags
+        if (combined_flags & MS_MSG_DEBUG) debug = true;
+        if (flags & MS_MSG_FORCE_BLOCK && flags & MS_MSG_FORCE_NON_BLOCKING) {
+            LOG_ALWAYS_FATAL("error: flags cannot force both blocking and non-blocking");
+        }
+        if (combined_flags & MS_MSG_BLOCK) {
+            if (!(flags & MS_MSG_FORCE_NON_BLOCKING) || flags & MS_MSG_FORCE_BLOCK) {
+                blocking = true;
+            }
+        }
+
+        if (combined_flags & MS_MSG_DEBUG) debug = true;
+        int8_t * memory_ = reinterpret_cast<int8_t*>(buffer);
+
+        if (length <= capacityInBytes) {
+            if (debug) LOG_INFO_TAG(TAG, "buffer can fit inside memory");
+            if (blocking) {
+                // wait until we have some data
+                READWRITE.load(1, "recv");
+                // we have data, read our data
+                for (int i = 0; i < length; i++) {
+                    memory_[i] = memory[RESERVED_CAPACITY + i].load();
+                }
+                // signal that we have read our data
+                READWRITE.store(nop, 2, "recv");
+            }
+        } else {
+            if (debug) LOG_INFO_TAG(TAG, "buffer cannot fit inside memory");
+        }
+        return 0;
+    };
+};
+
+#endif /* MemorySocket_hpp */

@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.4.1)
+
+testBuilder_add_source(MemorySocket_Tests MemorySocket_Tests.cpp)
+testBuilder_add_library(MemorySocket_Tests gtest_main)
+testBuilder_add_library(MemorySocket_Tests MemorySocket)
+testBuilder_build(MemorySocket_Tests EXECUTABLES)
+
+testBuilder_add_source(binary_semaphore_test binary_semaphore_test.cpp)
+testBuilder_add_library(binary_semaphore_test pthread)
+testBuilder_build(binary_semaphore_test EXECUTABLES)
